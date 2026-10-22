@@ -1,0 +1,4 @@
+# Additional packages for the optional integration and conversion plugins.
+# Existing provider, GUI and automation packages stay as installed.
+mcp>=1.28,<2
+imageio-ffmpeg>=0.6,<1

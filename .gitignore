@@ -1,0 +1,66 @@
+# ── MARK LVI — what never belongs in the repository ──────────────────────────
+# Everything listed here is created by the app on first run. A fresh clone with
+# none of it present boots straight to the setup screen, which is the intended
+# first experience — so nothing here needs to be committed, and some of it must
+# never be.
+
+# ── Secrets. Committing any of these publishes them. ──────────────────────────
+# API/plugin credentials, TLS private keys, linked WhatsApp sessions.
+config/api_keys.json
+config/certs/
+config/whatsapp_web/
+config/*.json
+# OAuth tokens and client credentials.
+**/token*.json
+**/client_secret*.json
+*credentials*.json
+config/**/*.json
+*.pem
+*.key
+*.pfx
+*.p12
+.git-credentials
+.env
+.env.*
+
+# ── Personal data the assistant accumulates about you ─────────────────────────
+memory/long_term.json
+memory/*.json
+memory/*.txt
+memory/*.pkl
+memory/*.db
+memory/*.db-*
+# Preserve Python source modules, exclude all runtime/private memory artifacts.
+/memory/*
+!/memory/*.py
+upgrade-backups/
+
+# ── Python build noise ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Editors and operating systems ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Runtime output ────────────────────────────────────────────────────────────
+*.log
+logs/
+downloads/
+screenshots/
