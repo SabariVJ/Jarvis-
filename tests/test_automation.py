@@ -69,10 +69,10 @@ class RuntimeTests(Isolated):
             self.assertIsNone(self.runtime.reserve_call("Ganesh", ctx))
         with patch("core.automation_runtime.time.time", return_value=131):
             self.assertIn("already attempted", self.runtime.reserve_call("Ganesh", {**ctx, "request_id": "id2"}))
-            self.runtime.new_turn("call Ganesh again")
+            self.runtime.new_turn("call Ganesh on WhatsApp")
             self.assertIsNone(self.runtime.reserve_call("Ganesh", self.runtime.context()))
         with patch("core.automation_runtime.time.time", return_value=150):
-            self.runtime.new_turn("call Appa")
+            self.runtime.new_turn("call Appa on WhatsApp")
             self.assertIn("cooldown", self.runtime.reserve_call("Appa", self.runtime.context()))
 
     def test_cancel_prevents_queued_side_effect(self):
@@ -273,7 +273,7 @@ class RoutingTests(unittest.TestCase):
         from google.genai import types
         registry = discover_plugins(Path(__file__).resolve().parents[1] / "plugins", set(), logger=lambda _: None)
         records = registry.list_for_ui()
-        self.assertEqual(len(records), 12)
+        self.assertEqual(len(records), 17)
         self.assertTrue(all(row["valid"] for row in records), records)
         for declaration in registry.get_tool_declarations():
             types.FunctionDeclaration(**{k: v for k, v in declaration.items() if k not in {"tier", "brief"}})

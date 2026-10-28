@@ -1,0 +1,211 @@
+--- a/main.py
++++ b/main.py
+@@ -859,12 +859,19 @@
+             voice = win32com.client.Dispatch('SAPI.SpVoice')
+             voice.Speak(str(text).split('Results:', 1)[0][:240], 1)
+             deadline = time.monotonic() + 15
+-            while voice.Status.RunningState == 2:
++            # Async Speak acceptance / an initially idle RunningState is not
++            # completion. Use bounded SAPI acknowledgment on this COM-owning
++            # worker; never queue an uncertain notification for later replay.
++            while True:
+                 if cancel.is_set() or self.ui.muted or not self._awake or time.monotonic() >= deadline:
+                     voice.Speak('', 3)
+                     return False
+-                time.sleep(.05)
+-            return True
++                if voice.WaitUntilDone(50):
++                    # Cancellation may arrive during the bounded wait.
++                    if cancel.is_set() or self.ui.muted or not self._awake:
++                        voice.Speak('', 3)
++                        return False
++                    return 'playback_completed; audibility_unverified'
+         finally:
+             self.set_speaking(False)
+             if not self._awake:
+--- a/core/local_notifications.py
++++ b/core/local_notifications.py
+@@ -3,6 +3,7 @@
+ import hashlib
+ import re
+ import time
++import threading
+ from core.automation_runtime import get_runtime
+ from memory.config_manager import get_plugin_config, get_plugin_enabled
+ 
+@@ -121,9 +122,20 @@
+                 if not callable(callback):
+                     record['channels'][channel] = 'unavailable'
+                 else:
++                    if channel == 'speech':
++                        record['speech_evidence'] = {'callback_thread_id': threading.get_ident(),
++                            'backend_completion_ack': False, 'human_audibility_verified': False}
++                        speech_started = time.monotonic()
+                     result = callback(message)
+-                    record['channels'][channel] = ('deferred_or_unavailable' if result is False else
+-                                                   'announced_locally' if channel == 'speech' else 'posted_to_dashboard')
++                    if channel == 'speech':
++                        acknowledged = (type(result) is str and result == 'playback_completed; audibility_unverified')
++                        record['speech_evidence'].update(callback_result_type=type(result).__name__,
++                            callback_seconds=round(time.monotonic()-speech_started, 6), backend_completion_ack=acknowledged)
++                        record['channels'][channel] = ('deferred_or_unavailable' if result is False else
++                            'playback_completed; audibility_unverified' if acknowledged else
++                            'submitted_to_speech; playback_unverified')
++                    else:
++                        record['channels'][channel] = 'deferred_or_unavailable' if result is False else 'posted_to_dashboard'
+         except Exception as exc:
+             record['channels'][channel] = 'failed:' + type(exc).__name__
+         rt.put('notification', identity, record)
+--- a/tests/test_phase51_execution.py
++++ b/tests/test_phase51_execution.py
+@@ -434,7 +434,7 @@
+                                  result_path='D:/results/result.txt', rt=self.runtime)
+         self.assertTrue(result['verified'])
+         self.assertIn('Results:', result['message'])
+-        self.assertEqual(result['channels']['speech'], 'announced_locally')
++        self.assertEqual(result['channels']['speech'], 'submitted_to_speech; playback_unverified')
+         self.assertIn('visibility_not_verified', result['channels']['desktop'])
+ 
+     def test_uncertain_completion_does_not_announce_success(self):
+--- /dev/null
++++ b/tests/test_notification_speech_evidence.py
+@@ -0,0 +1,139 @@
++"""No sound generated: actual method via AST, synthetic COM and delivery fixtures."""
++import ast
++from pathlib import Path
++import sys
++import threading
++import time
++from types import SimpleNamespace
++from unittest.mock import Mock,patch
++from test_automation import Isolated
++from core import local_notifications as alerts
++
++
++class SpeechEvidenceTests(Isolated):
++    def setUp(self):
++        super().setUp()
++        self.runtime.dashboard_notify=Mock(return_value=True)
++        self.runtime.local_speech=Mock(return_value=True)
++        cfg=patch.object(alerts,'get_plugin_config',return_value={'routes_json':'{"completed":["dashboard","speech"]}'})
++        cfg.start();self.addCleanup(cfg.stop)
++        enabled=patch.object(alerts,'get_plugin_enabled',return_value=True)
++        enabled.start();self.addCleanup(enabled.stop)
++
++    def emit(self,identity='synthetic-speech'):
++        return alerts.emit(identity,'completed','synthetic',verified=True,rt=self.runtime)
++
++    def test_callback_unavailable(self):
++        self.runtime.local_speech=None
++        self.assertEqual(self.emit()['channels']['speech'],'unavailable')
++
++    def test_false_is_deferred(self):
++        self.runtime.local_speech.return_value=False
++        self.assertEqual(self.emit()['channels']['speech'],'deferred_or_unavailable')
++
++    def test_exception_is_not_delivery_and_does_not_leak(self):
++        self.runtime.local_speech.side_effect=RuntimeError('PRIVATE DETAIL')
++        r=self.emit()
++        self.assertEqual(r['channels']['speech'],'failed:RuntimeError')
++        self.assertNotIn('PRIVATE',str(r))
++
++    def test_acceptance_without_ack_is_unverified(self):
++        for index,result in enumerate([True,None,'accepted','announced_locally',Mock()]):
++            self.runtime.local_speech.return_value=result
++            r=self.emit(str(index))
++            self.assertEqual(r['channels']['speech'],'submitted_to_speech; playback_unverified')
++            self.assertFalse(r['speech_evidence']['backend_completion_ack'])
++
++    def test_explicit_backend_ack_never_claims_human_audibility(self):
++        self.runtime.local_speech.return_value='playback_completed; audibility_unverified'
++        r=self.emit()
++        self.assertTrue(r['speech_evidence']['backend_completion_ack'])
++        self.assertFalse(r['speech_evidence']['human_audibility_verified'])
++
++    def test_duplicate_event_never_replays(self):
++        self.emit();self.emit()
++        self.runtime.local_speech.assert_called_once()
++
++    def test_closing_during_pending_callback_remains_uncertain_without_replay(self):
++        self.runtime.local_speech.side_effect=SystemExit()
++        with self.assertRaises(SystemExit):self.emit()
++        r=self.emit()
++        self.assertEqual(r['channels']['speech'],'dispatching_outcome_unverified')
++        self.runtime.local_speech.assert_called_once()
++
++    def test_quiet_hours_prevent_callback(self):
++        with patch.object(alerts,'quiet_now',return_value=True):r=self.emit()
++        self.assertEqual(r['channels']['speech'],'suppressed_quiet_hours')
++        self.runtime.local_speech.assert_not_called()
++
++    def method(self):
++        source=ast.parse((Path(__file__).resolve().parents[1]/'main.py').read_text(encoding='utf-8'))
++        node=next(n for n in ast.walk(source) if isinstance(n,ast.FunctionDef) and n.name=='_announce_local')
++        env={'threading':threading,'time':time}
++        exec(compile(ast.fix_missing_locations(ast.Module(body=[node],type_ignores=[])),'staged-local-speech','exec'),env)
++        host=SimpleNamespace(_awake=True,ui=SimpleNamespace(muted=False,set_state=Mock()),_speaking_lock=threading.Lock(),_is_speaking=False)
++        host.set_speaking=lambda value:setattr(host,'_is_speaking',value)
++        voice=Mock();voice.WaitUntilDone.return_value=True
++        return env['_announce_local'],host,voice
++
++    def invoke(self,method,host,voice):
++        import win32com.client
++        with patch.object(win32com.client,'Dispatch',return_value=voice),patch.dict(sys.modules,{'pythoncom':Mock()}):
++            return method(host,'Task completed. Results: private path')
++
++    def test_busy_conversation_suppresses_notification(self):
++        method,host,voice=self.method();host._is_speaking=True
++        self.assertIs(self.invoke(method,host,voice),False)
++        voice.Speak.assert_not_called()
++
++    def test_cancelled_before_playback(self):
++        method,host,voice=self.method();host._awake=False
++        self.assertIs(self.invoke(method,host,voice),False)
++        voice.Speak.assert_not_called()
++
++    def test_initial_idle_does_not_count_as_completion(self):
++        method,host,voice=self.method();voice.Status.RunningState=1
++        voice.WaitUntilDone.side_effect=[False,True]
++        result=self.invoke(method,host,voice)
++        self.assertEqual(voice.WaitUntilDone.call_count,2)
++        self.assertEqual(result,'playback_completed; audibility_unverified')
++        self.assertFalse(host._is_speaking)
++
++    def test_cancel_during_pending_playback(self):
++        method,host,voice=self.method()
++        def waiting(timeout):host._local_speech_cancel.set();return False
++        voice.WaitUntilDone.side_effect=waiting
++        self.assertIs(self.invoke(method,host,voice),False)
++        self.assertEqual(voice.Speak.call_args.args,('',3))
++
++    def test_cancel_concurrent_with_completion_wins(self):
++        method,host,voice=self.method()
++        def waiting(timeout):host._local_speech_cancel.set();return True
++        voice.WaitUntilDone.side_effect=waiting
++        self.assertIs(self.invoke(method,host,voice),False)
++
++    def test_timeout_purges_once_no_retry(self):
++        method,host,voice=self.method();voice.WaitUntilDone.return_value=False
++        with patch.object(time,'monotonic',side_effect=[0,20]):
++            self.assertIs(self.invoke(method,host,voice),False)
++        self.assertEqual(voice.Speak.call_args.args,('',3))
++
++    def test_com_backend_error_releases_speaking_flag(self):
++        method,host,voice=self.method();voice.WaitUntilDone.side_effect=RuntimeError('synthetic')
++        with self.assertRaises(RuntimeError):self.invoke(method,host,voice)
++        self.assertFalse(host._is_speaking)
++
++    def test_com_and_callback_own_the_same_worker_thread(self):
++        method,host,voice=self.method();ids=[];results=[]
++        import win32com.client
++        com=Mock();com.CoInitialize.side_effect=lambda:ids.append(threading.get_ident())
++        voice.WaitUntilDone.side_effect=lambda timeout:ids.append(threading.get_ident()) or True
++        def worker():
++            self.runtime.local_speech=lambda message:method(host,message)
++            results.append(self.emit())
++        with patch.object(win32com.client,'Dispatch',return_value=voice),patch.dict(sys.modules,{'pythoncom':com}):
++            thread=threading.Thread(target=worker);thread.start();thread.join(5)
++        self.assertFalse(thread.is_alive());self.assertEqual(len(results),1)
++        self.assertTrue(all(i==thread.ident for i in ids))
++        self.assertEqual(results[0]['speech_evidence']['callback_thread_id'],thread.ident)
++        self.assertNotEqual(thread.ident,threading.get_ident())

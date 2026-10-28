@@ -1,0 +1,3 @@
+# Optional only. Install after selecting/approving a telephone provider.
+# Credentials are read from the authorized process environment, never source.
+twilio>=9.0,<10

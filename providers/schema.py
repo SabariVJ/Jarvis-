@@ -83,6 +83,7 @@ CORE_TOOLS: tuple[str, ...] = (
     "open_app",
     "computer_settings",
     "computer_control",
+    "github_git",
     "file_controller",
     "browser_control",
     "web_search",

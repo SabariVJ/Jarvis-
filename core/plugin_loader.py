@@ -305,16 +305,22 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
             continue
         try:
             module_name = f"plugins.{path.stem}"
-            spec = importlib.util.spec_from_file_location(module_name, path)
-            if spec is None or spec.loader is None:
-                raise ImportError("could not build import spec")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            try:
-                spec.loader.exec_module(module)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
+            module = sys.modules.get(module_name)
+            loaded_path = getattr(module, '__file__', None)
+            # Discovery is not hot reload. Replacing the same imported module
+            # duplicates singleton worker pools and invalidates existing plugin
+            # references. Preserve it when the source identity is unchanged.
+            if module is None or not loaded_path or Path(loaded_path).resolve() != path.resolve():
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    raise ImportError("could not build import spec")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    sys.modules.pop(module_name, None)
+                    raise
 
             rec = _validate(module, path.name)
 

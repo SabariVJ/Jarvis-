@@ -36,6 +36,9 @@ class AutomationRuntime:
         self.notify = None
         self._recording = None
         self._local = threading.local()
+        self._calling_pending = None
+        self._calling_reply = None
+        self._calling_grant = None
         self._context = self.get("context", "session", self._context)
         # Conversation restoration is not execution authorization. Retain the
         # old IDs for diagnosis, but never resume foreground work on startup.
@@ -121,28 +124,59 @@ class AutomationRuntime:
                         context.get('request_id'), context.get('source'), event, name, json.dumps(details, default=str)))
 
     def new_turn(self, text, source='user'):
+        submitted_at = time.time()
         with self._state_lock:
             old = self._context.copy()
             if old.get('execution_id'):
                 self.finish(old, 'superseded')
             identity = uuid.uuid4().hex
             self._context.update(turn_id=identity, execution_id=identity, task_id=identity,
-                                 source=source, lifecycle='foreground', user_text=str(text)[:2000])
-            from core.command_router import plan
+                                 source=source, lifecycle='foreground', user_text=str(text)[:2000],
+                                 input_final=source != 'speech_live')
+            from core.calling_intents import advance, followup
+            advance(self, old, text, self._context['input_final'])
+            from core.command_router import authorization_plan as plan
             self.put('execution', identity, {'state': 'active', 'lifecycle': 'foreground',
                      'turn_id': identity, 'task_id': identity, 'source': source,
-                     'plan': plan(text), 'plan_next': 0})
+                     'plan': followup(self, self._context) or plan(text), 'plan_next': 0})
             self.put("context", "session", self._context)
             context = self.context()
-            self.trace('command_started', context)
+            self.trace('command_started', context, submitted_at=submitted_at)
             return context
 
-    def update_turn_text(self, text):
+    def set_route(self, context, steps):
+        with self._state_lock:
+            self.check_cancelled(context)
+            execution = self.get('execution', context['execution_id'])
+            if execution.get('plan_next', 0) or execution.get('batches'):
+                raise InterruptedError('Cannot replace a command plan after dispatch')
+            self.update('execution', context['execution_id'], {'plan': steps,
+                        'step_progress': [{'state': 'pending'} for _ in steps]})
+
+    def report_outcome(self, context, channel):
+        """A report timestamp, not proof that an unverified action succeeded."""
+        with self.db() as db:
+            row = db.execute("SELECT at,details FROM automation_events WHERE execution_id=? AND event='tool_finished' ORDER BY seq DESC LIMIT 1",
+                             (context.get('execution_id'),)).fetchone()
+        if row:
+            verified = json.loads(row['details']).get('state') == 'done'
+            self.trace('outcome_reported', context, channel=channel, verified=verified,
+                       seconds_since_tool_finish=max(0, time.time() - row['at']))
+
+    def update_turn_text(self, text, final=True):
         with self._state_lock:
             self._context['user_text'] = str(text)[:2000]
-            from core.command_router import plan
+            self._context['input_final'] = bool(final)
+            from core.calling_intents import refresh, followup
+            refresh(self, text, final)
+            from core.command_router import authorization_plan as plan
             if self._context.get('execution_id'):
-                self.update('execution', self._context['execution_id'], {'plan': plan(text)})
+                self.update('execution', self._context['execution_id'], {'plan': followup(self, self._context) or plan(text)})
+
+    def clear_calling_context(self):
+        from core.calling_intents import clear
+        with self._state_lock:
+            clear(self)
 
     def finish(self, context, state='completed'):
         identity = context.get('execution_id')
@@ -152,6 +186,11 @@ class AutomationRuntime:
                 if current and current['state'] in {'active', 'draining'}:
                     self.update('execution', identity, {'state': state})
                     self.trace('execution_' + state, context)
+                if state in {'cancelled', 'interrupted'} and identity == self._context.get('execution_id'):
+                    self.clear_calling_context()
+                elif state == 'completed' and (self._calling_grant or {}).get('execution_id') == identity:
+                    self._calling_grant = None
+                    self._calling_reply = None
 
     def admit_batch(self, context):
         with self._state_lock:
@@ -200,15 +239,20 @@ class AutomationRuntime:
         with self._state_lock:
             return {**self._context, "request_id": request_id, "generation": self._generation}
 
-    def cancel(self):
+    def cancel(self, all_jobs=False):
         with self._state_lock:
             self._generation += 1
+            self.clear_calling_context()
             self.finish(self._context, 'cancelled')
-            self.trace('cancellation_requested', self._context)
+            if all_jobs:
+                for key, job in self.records('job').items():
+                    if job.get('state') in {'queued', 'running', 'checkpoint', 'paused'}:
+                        self.update('job', key, {'cancel_requested': True})
+            self.trace('cancellation_requested', self._context, all_jobs=all_jobs)
 
     def check_cancelled(self, context):
         context = context or getattr(self._local, 'context', None)
-        if context and context.get("generation", self._generation) != self._generation:
+        if context and context.get('lifecycle') != 'job' and context.get("generation", self._generation) != self._generation:
             raise InterruptedError("Task cancelled; no further steps will run.")
         if context:
             execution = self.get('execution', context.get('execution_id', ''))
@@ -251,13 +295,21 @@ class AutomationRuntime:
     def authorize(self, name, args, context):
         self.check_cancelled(context)
         if name == 'whatsapp_control' and str(args.get('action', '')).endswith('_call'):
-            text = context.get('user_text', '').casefold()
-            contact = ' '.join(str(args.get('contact', '')).casefold().split())
-            if context.get('lifecycle') == 'job' or not re.search(r'\b(call|phone|ring)\b', text) or contact not in ' '.join(text.split()):
+            if (context.get('command_source') or context.get('source')) == 'speech_live' and not context.get('input_final'):
+                raise InterruptedError('A finished user transcript is required before authorizing a call')
+            from core.calling_intents import permits_followup, authorization
+            from core.command_router import canonical_arguments
+            followup_allowed = permits_followup(self, args, context)
+            explicit = authorization(context.get('user_text', '')) or []
+            explicit_allowed = any(n == name and canonical_arguments(n, a) == canonical_arguments(name, args)
+                                   for n, a in explicit)
+            if context.get('lifecycle') == 'job' or not (followup_allowed or explicit_allowed):
                 raise InterruptedError('A fresh explicit user request naming this contact is required for a call')
         execution = self.get('execution', context['execution_id'])
         steps = execution.get('plan')
         if steps is not None:
+            if execution.get('plan_blocked'):
+                raise InterruptedError('A preceding step was not verified; dependent actions are blocked')
             from core.command_router import canonical_arguments
             signature = (name, canonical_arguments(name, args))
             allowed = [(n, canonical_arguments(n, a)) for n, a in steps]
@@ -304,10 +356,13 @@ class AutomationRuntime:
 
     @contextmanager
     def desktop(self, context=None):
+        waiting = time.perf_counter()
         if not self._desktop.acquire(timeout=20):
             raise TimeoutError("Another desktop action is still running.")
         com = None
         try:
+            self.trace('performance_span', context, phase='desktop_lock_wait', parent=None,
+                       seconds=round(time.perf_counter() - waiting, 6))
             if os.name == "nt":
                 import pythoncom
                 pythoncom.CoInitialize()
@@ -323,7 +378,15 @@ class AutomationRuntime:
         """Atomically reserve one call attempt across threads/processes/restarts."""
         context = context or {}
         if context:
-            self.authorize('whatsapp_control', {'action': 'voice_call', 'contact': contact}, context)
+            action = 'voice_call'
+            execution = self.get('execution', context.get('execution_id', ''), {})
+            planned = execution.get('plan') or []
+            index = execution.get('plan_next', 0)
+            if index < len(planned) and planned[index][0] == 'whatsapp_control':
+                candidate = planned[index][1].get('action')
+                if candidate in {'voice_call', 'video_call'}:
+                    action = candidate
+            self.authorize('whatsapp_control', {'action': action, 'contact': contact}, context)
         token = context.get("turn_id") or context.get("request_id")
         key = "call:" + hashlib.sha256((str(token) + ":" + contact.casefold()).encode()).hexdigest()
         now = time.time()
@@ -338,6 +401,21 @@ class AutomationRuntime:
             if token:
                 db.execute("INSERT OR REPLACE INTO guards VALUES (?,?)", (key, now))
         return None
+
+    def receipt_id(self, name, args, context):
+        from core.command_router import canonical_arguments
+        payload = json.dumps([name, canonical_arguments(name, args)], sort_keys=True, ensure_ascii=False)
+        scope = str(context.get('execution_id')) + ':' + str(context.get('step_id', ''))
+        if context.get('lifecycle') == 'job':
+            scope = 'job:' + context['task_id'] + ':' + str(context.get('step_id', ''))
+        if context.get('retry_attempt'):
+            scope += ':retry:' + str(context['retry_attempt'])
+        return hashlib.sha256((scope + payload).encode()).hexdigest()
+
+    def lookup_receipt(self, name, args, context):
+        with self.db() as db:
+            row = db.execute('SELECT * FROM receipts WHERE id=?', (self.receipt_id(name, args, context),)).fetchone()
+        return dict(row) if row else None
 
     def execute(self, name, args, invoke, context=None):
         context = context or self.context()
@@ -359,10 +437,10 @@ class AutomationRuntime:
         # Provider call IDs can change on reconnect or be reused. They are
         # diagnostic only; execution + explicit recipe step + canonical args
         # determine idempotency, even when the provider supplies no call ID.
-        scope = str(context.get('execution_id')) + ':' + str(context.get('step_id', ''))
-        if context.get('lifecycle') == 'job':
-            scope = 'job:' + context['task_id'] + ':' + str(context.get('step_id', ''))
-        receipt = hashlib.sha256((scope + payload).encode()).hexdigest()
+        if context.get('retry_attempt'):
+            from plugins.task_manager import authorize_retry
+            authorize_retry(self, name, args, context)
+        receipt = self.receipt_id(name, args, context)
         self.trace('tool_received', context, name, arguments_sha256=hashlib.sha256(payload.encode()).hexdigest(),
                    app=canonical_arguments(name, args).get('app_name'), action=args.get('action'), receipt=receipt)
         with self.db() as db:
@@ -376,6 +454,7 @@ class AutomationRuntime:
             return previous["result"] or outcome.unverified(name, "Earlier execution is still running or was interrupted; not replayed")
         start = time.monotonic()
         attempted = False
+        invocation_started = None
         previous_context = getattr(self._local, 'context', None)
         self._local.context = context
         try:
@@ -384,18 +463,23 @@ class AutomationRuntime:
                     self.authorize(name, args, context)
                     self.trace('tool_running', context, name, receipt=receipt)
                     attempted = True
+                    invocation_started = time.perf_counter()
                     result = invoke()
             else:
                 self.authorize(name, args, context)
                 self.trace('tool_running', context, name, receipt=receipt)
                 attempted = True
+                invocation_started = time.perf_counter()
                 result = invoke()
             result = str(result or outcome.unverified(name, "Tool returned no result"))
         except Exception as exc:
             result = outcome.failed(name, f"{type(exc).__name__}: {exc}")
         finally:
             self._local.context = previous_context
-        status = "done" if result.startswith("status=done ") else "reported"
+            if invocation_started is not None:
+                self.trace('performance_span', context, phase='tool_execution', parent=None,
+                           seconds=round(time.perf_counter() - invocation_started, 6))
+        status = "done" if outcome.is_verified(result) else "reported"
         if outcome.is_problem(result):
             status = "problem"
         with self.db() as db:
@@ -404,7 +488,13 @@ class AutomationRuntime:
         with self._state_lock:
             execution = self.get('execution', context['execution_id'], {})
             if attempted and execution.get('plan') is not None:
-                self.update('execution', context['execution_id'], {'plan_next': execution.get('plan_next', 0) + 1})
+                index = execution.get('plan_next', 0)
+                progress = execution.get('step_progress') or [{'state': 'pending'} for _ in execution['plan']]
+                if index < len(progress):
+                    progress[index] = {'state': 'verified' if status == 'done' else 'failed'}
+                self.update('execution', context['execution_id'], {
+                    'plan_next': index + 1 if status == 'done' else index,
+                    'plan_blocked': status != 'done', 'step_progress': progress})
             owns_foreground = self._context.get('execution_id') == context.get('execution_id')
             if owns_foreground:
                 self._context.update(last_tool=name, last_result=result[:1200])

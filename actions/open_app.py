@@ -324,7 +324,9 @@ def open_app(parameters=None, response=None, player=None,
     # application the assistant lives inside reports `started` and goes off to
     # launch a second copy of it — seen exactly that way, against a packaged
     # build whose siblings the close guard had just learnt to protect.
-    existing = [m for m in appidentity.running(spoken, include_self=True) if m.score >= 30]
+    from core.automation_metrics import measure
+    with measure('application_detection', session_memory):
+        existing = [m for m in appidentity.running(spoken, include_self=True) if m.score >= 30]
     if existing:
         best = existing[0]
         # ALREADY RUNNING IS NOT ALREADY DONE.

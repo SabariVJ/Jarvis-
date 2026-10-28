@@ -11,6 +11,7 @@ Dependencies: pywinauto, pyautogui, pyperclip
 """
 
 import os
+import re
 import time
 from core import outcome
 from core.automation_runtime import get_runtime
@@ -38,7 +39,9 @@ PLUGIN = {
         "or start a WhatsApp video call. "
         "Actions: search, open_chat, voice_call, video_call. "
         "Require the saved contact name and verify the chat header "
-        "before placing a requested call."
+        "before placing a requested call. Calling controls are separate from telephone-provider configuration. "
+        "No incoming-answer, live call-state or verified end-call action is exposed. A click is NOT a verified connection. "
+        "Video controls exist; live video reliability is unverified. Use calling_assistant for general calling questions."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -65,6 +68,47 @@ PLUGIN = {
 
 def _norm(value):
     return " ".join(str(value or "").casefold().split())
+
+
+def summarize(payload):
+    text = str(payload or '')
+    if 'state=external_permission_required' in text and 'permission_ui_observed=true' in text:
+        return 'WhatsApp displayed a microphone/camera permission dialog. Please review it in WhatsApp; I did not accept it. No call connection is verified.'
+    if 'state=call_menu_opened' in text:
+        return 'WhatsApp call options opened, but I could not identify the requested call option. Call initiation is not verified; I will not retry automatically.'
+    if 'state=call_attempt_uncertain' in text:
+        return 'The WhatsApp call attempt had an uncertain outcome. I will not retry automatically. Check WhatsApp; no ringing or connection is verified.'
+    if text.startswith('status=unverified ') and 'retry_allowed=false' in text:
+        return 'I pressed the WhatsApp call control once. Ringing and connection are not independently verified. I will not retry automatically.'
+    if text.startswith('status=done ') and 'chat_verified=true' in text:
+        return 'The requested WhatsApp conversation is open and its chat header was verified.'
+    if text:
+        return 'WhatsApp reported: ' + text[:1400]
+    return None
+
+
+def _permission_evidence(window):
+    """Observe only a same-process visible permission Window; never click it.
+
+    Chat text, ordinary buttons and other applications are not permission proof.
+    OS-owned prompts outside this app are unobserved, not inferred from errors.
+    """
+    for dialog in _items(window, ('Window',)):
+        try:
+            if not dialog.is_visible() or dialog.process_id() != window.process_id():
+                continue
+            title, kind, _ = _props(dialog)
+            title = _norm(title)
+            if kind != 'Window' or not re.search(r'\b(microphone|camera)\b', title) or not re.search(r'\b(permission|access|allow)\b', title):
+                continue
+            labels = {_norm(_props(item)[0]) for item in _items(dialog, ('Button',)) if item.is_visible()}
+            if labels & {'allow', 'allow access'} and labels & {'deny', "don't allow", 'do not allow', 'not now'}:
+                return {'title': title[:120], 'process_id': dialog.process_id()}
+        except InterruptedError:
+            raise
+        except Exception:
+            continue
+    return None
 
 
 def _ui():
@@ -526,6 +570,7 @@ def run(parameters, player=None, session_memory=None):
 
 
 def _run(parameters, player=None, session_memory=None):
+    call_attempted = False
     action = str(
         parameters.get("action", "")
     ).strip().lower()
@@ -547,10 +592,22 @@ def _run(parameters, player=None, session_memory=None):
     if not contact or len(contact) > 120:
         return "Please provide the exact saved contact name."
 
+    if action.endswith('_call'):
+        from memory.config_manager import get_plugin_config
+        own = get_plugin_config('whatsapp_control')
+        blocked_names = {'me', 'myself', 'my phone', 'my own number', 'yourself',
+                         _norm(own.get('self_contact', '')), _norm(own.get('self_number', ''))} - {''}
+        if _norm(contact) in blocked_names or re.search(r'\(\s*you\s*\)', contact, re.I):
+            return outcome.failed('whatsapp_control', 'Cannot call this WhatsApp account from itself; no call was attempted')
+
     try:
         if action.endswith("_call") and _active_call():
             return outcome.failed("whatsapp_control", "A WhatsApp call is already active")
         window = _ensure_window()
+        if action.endswith('_call') and _permission_evidence(window):
+            return outcome.failed('whatsapp_control', 'Visible WhatsApp permission dialog; owner review required; no dialog was accepted',
+                                  state='external_permission_required', permission_ui_observed=True,
+                                  call_initiation_attempted=False)
         results = _search(window, contact)
 
         if action == "search":
@@ -575,7 +632,8 @@ def _run(parameters, player=None, session_memory=None):
         )
 
         if error:
-            return error
+            state = 'contact_not_found' if not results else 'contact_ambiguous' if len(results) > 1 else 'chat_unverified'
+            return outcome.failed('whatsapp_control', error, state=state, call_initiation_attempted=False)
 
         if action == "open_chat":
             return outcome.done("whatsapp_control", contact=contact, chat_verified=True)
@@ -613,6 +671,7 @@ def _run(parameters, player=None, session_memory=None):
         # The reservation is retained even if clicking raises: the outcome may
         # be uncertain. Never retry a call in an exception handler.
         with rt.side_effect('whatsapp_call_click', session_memory, contact_verified=True, video=video):
+            call_attempted = not opens_menu
             button.click_input()
 
         if opens_menu:
@@ -624,24 +683,30 @@ def _run(parameters, player=None, session_memory=None):
             )
 
             if option is None:
-                return (
-                    "Call options were opened, but I "
-                    "could not identify the correct "
-                    "voice/video option. Select it manually."
-                )
+                return outcome.unverified('whatsapp_control', 'Call menu opened; requested option not identified',
+                                          state='call_menu_opened', call_initiation_attempted=False, retry_allowed=False)
 
             rt.check_cancelled(session_memory)
             if not _header_matches(window, contact):
                 return outcome.failed("whatsapp_control", "Chat changed while call menu was open; stopped")
             with rt.side_effect('whatsapp_call_menu_click', session_memory, contact_verified=True, video=video):
+                call_attempted = True
                 option.click_input()
 
         kind = "video" if video else "voice"
 
+        if _permission_evidence(window):
+            return outcome.unverified('whatsapp_control', 'Visible WhatsApp permission dialog; no dialog was accepted',
+                                      state='external_permission_required', permission_ui_observed=True,
+                                      call_initiation_attempted=call_attempted, retry_allowed=False)
+
         return outcome.unverified("whatsapp_control", "Pressed call control once; outgoing call not independently verified",
-                                  contact=contact, kind=kind, retry_allowed=False)
+                                  contact=contact, kind=kind, call_initiation_attempted=True, state='call_initiation_attempted', retry_allowed=False)
 
     except Exception as exc:
+        if call_attempted:
+            return outcome.unverified('whatsapp_control', 'Call attempt interrupted; no automatic retry',
+                                      state='call_attempt_uncertain', call_initiation_attempted=True, retry_allowed=False)
         return (
             "WhatsApp automation stopped safely: "
             f"{type(exc).__name__}: {exc}"

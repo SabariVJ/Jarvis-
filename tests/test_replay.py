@@ -70,7 +70,7 @@ class ReplayTests(Isolated):
             self.assertFalse(state['WhatsApp'])
             self.assertTrue(state['Google Chrome'])
 
-    def test_failed_close_is_reported_and_chrome_still_opens(self):
+    def test_failed_close_is_reported_and_dependent_chrome_open_is_blocked(self):
         from actions import computer_control
         context = self.runtime.new_turn('Close WhatsApp and open Chrome')
         target = SimpleNamespace(pid=100, label='WhatsApp', score=100, is_self=False)
@@ -82,7 +82,7 @@ class ReplayTests(Isolated):
         self.assertIn('status=failed', result)
         self.assertNotIn('status=done', result)
         self.execute('open_app', {'app_name': 'Chrome'}, chrome, context)
-        chrome.assert_called_once()
+        chrome.assert_not_called()
 
     def test_recreated_process_is_not_reported_closed(self):
         from actions import computer_control

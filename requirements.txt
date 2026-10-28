@@ -130,10 +130,12 @@ pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
 # only ever uses Gemini should not pay for them. Deleting providers/ removes
 # the whole feature and the app runs exactly as it did before it existed.
 
-# ── Optional: local wake word ("Hey Jarvis") ──────────────────────────────────
+# ── Optional: configurable local wake phrases ────────────────────────────────
 # Deliberately NOT installed by default — it's opt-in. Enable it (and download
 # the tiny model) with one click from ⚙ → WAKE WORD in the app, or install it
-# yourself with:  pip install openwakeword
+# Custom phrases use vosk==0.3.45 and its small English model. The WAKE WORD
+# setup button installs them under downloads/ on the project drive. No cloud
+# recognition runs while sleeping. Existing openwakeword packages can remain.
 #
 # macOS / Linux OS actions (volume, brightness, reminders) shell out to native
 # tools (pactl / brightnessctl / osascript / systemd), so no extra Python

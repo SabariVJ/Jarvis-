@@ -1,211 +1,227 @@
-"""
-Local wake-word detection for JARVIS ("Hey Jarvis").
+"""Local configurable wake phrases; sleeping PCM never goes to a cloud model.
 
-Design goals:
-  • ZERO cost when the feature is off — openwakeword is imported ONLY inside
-    start()/install helpers, never at module load. If the user never enables
-    wake word, none of this touches the app.
-  • ZERO latency on the audio path — the microphone callback only ever does a
-    cheap, non-blocking queue push (feed()); the actual model inference runs in
-    this module's own background thread, so the real-time audio thread and the
-    Gemini stream are never slowed.
-  • Fully local & offline — audio fed here never leaves the machine; there is no
-    network call except the one-time model download the user triggers from the UI.
-
-openwakeword ships small ONNX models (a few MB each) and runs comfortably on a
-CPU. The pretrained wake phrase used here is "Hey Jarvis".
+One lazy Vosk model, bounded worker queue, final matching, and an arm latch.
+No inference while awake/off. No download during start().
 """
 from __future__ import annotations
-
+import importlib.util
+import json
+from pathlib import Path
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
-from pathlib import Path
-from typing import Callable
+import time
+import zipfile
+from core.wake_phrases import DEFAULT_PHRASE, matches, recognition_phrases, validate
 
-# Pretrained openwakeword model that listens for "Hey Jarvis".
-WAKE_MODEL = "hey_jarvis"
-# Score in [0,1]; above this counts as a detection. Tunable per environment.
-DEFAULT_THRESHOLD = 0.5
-# Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
+ROOT = Path(__file__).resolve().parents[1]
+RUNTIME_DIR = ROOT / 'downloads/wake-runtime'
+MODEL_NAME = 'vosk-model-small-en-us-0.15'
+MODEL_DIR = ROOT / 'downloads/wake-models' / MODEL_NAME
+MODEL_URL = 'https://alphacephei.com/vosk/models/' + MODEL_NAME + '.zip'
 SAMPLE_RATE = 16000
+DEFAULT_THRESHOLD = .75
+_install_lock = threading.Lock()
 
 
-def is_installed() -> bool:
-    """True if the openwakeword package is importable (no model check)."""
-    try:
-        import importlib.util
-        return importlib.util.find_spec("openwakeword") is not None
-    except Exception:
-        return False
+def is_installed():
+    return (RUNTIME_DIR / 'vosk/__init__.py').is_file() or importlib.util.find_spec('vosk') is not None
 
 
-def is_ready() -> bool:
-    """True if openwakeword is installed AND its model files are present on disk.
-
-    This is a cheap, DETERMINISTIC file-existence check. It deliberately does NOT
-    construct a Model to probe readiness — doing that is slow and, worse, can clash
-    with the detector's own Model when it's already running, which intermittently
-    returned False and made the UI flicker to 'not downloaded'. Never raises.
-    """
-    if not is_installed():
-        return False
-    try:
-        import openwakeword
-        models_dir = Path(openwakeword.__file__).resolve().parent / "resources" / "models"
-        if not models_dir.is_dir():
-            return False
-        has_wake = (any(models_dir.glob(f"{WAKE_MODEL}*.onnx"))
-                    or any(models_dir.glob(f"{WAKE_MODEL}*.tflite")))
-        has_mel = (any(models_dir.glob("melspectrogram*.onnx"))
-                   or any(models_dir.glob("melspectrogram*.tflite")))
-        has_emb = (any(models_dir.glob("embedding_model*.onnx"))
-                   or any(models_dir.glob("embedding_model*.tflite")))
-        return bool(has_wake and has_mel and has_emb)
-    except Exception:
-        return False
+def is_ready():
+    return is_installed() and all((MODEL_DIR / name).is_file() for name in ('am/final.mdl', 'conf/model.conf', 'graph/HCLr.fst', 'graph/Gr.fst'))
 
 
-def install_and_download(logger: Callable[[str], None] = print,
-                         notify: Callable[[str], None] | None = None) -> tuple[bool, str]:
-    """
-    One-click setup for the UI button: pip-install openwakeword if missing, then
-    download the wake model. Returns (ok, message). Never raises — every failure
-    is reported through the returned message and the logger.
-    """
-    _tell = notify or (lambda _msg: None)
-    try:
-        if not is_installed():
-            logger("Wake word: installing openwakeword (one-time)…")
-            _tell("Wake word: installing openwakeword (one-time)…")
-            r = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "openwakeword"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-            )
-            if r.returncode != 0:
-                tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or [""]
-                return False, f"pip install failed: {tail[0][:160]}"
-        # Download the pretrained melspectrogram/embedding + wake models.
-        logger("Wake word: downloading models…")
-        _tell("Wake word: downloading models…")
+def install_and_download(logger=print, notify=None):
+    """Explicit setup only; project-local files avoid filling the system disk."""
+    with _install_lock:
+        tell = notify or logger
         try:
-            import openwakeword.utils as _u
-            try:
-                _u.download_models([WAKE_MODEL])
-            except TypeError:
-                _u.download_models()   # older signature downloads the default set
-        except Exception as e:
-            return False, f"model download failed: {e}"
-
-        if not is_ready():
-            return False, "installed, but the wake model could not be loaded."
-        logger("Wake word: ready.")
-        return True, "Wake word installed and ready."
-    except Exception as e:
-        return False, f"setup error: {e}"
+            temp_root = ROOT / 'downloads/wake-temp'
+            temp_root.mkdir(parents=True, exist_ok=True)
+            if not (RUNTIME_DIR / 'vosk/__init__.py').is_file():
+                import os
+                env = {**os.environ, 'TEMP': str(temp_root), 'TMP': str(temp_root)}
+                tell('Installing the local custom-wake recognizer on the project drive…')
+                result = subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-cache-dir', '--no-deps',
+                    '--target', str(RUNTIME_DIR), 'vosk==0.3.45', 'srt==3.5.3'], capture_output=True,
+                    text=True, encoding='utf-8', errors='replace', env=env, timeout=240)
+                if result.returncode:
+                    return False, 'Wake runtime setup failed: ' + (result.stderr or result.stdout)[-400:]
+            if not is_ready():
+                import requests
+                tell('Downloading the offline English wake model (about 40 MB)…')
+                MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix='wake-setup-', dir=temp_root) as folder:
+                    archive = Path(folder) / 'model.zip'
+                    size = 0
+                    with requests.get(MODEL_URL, stream=True, timeout=(15, 90), allow_redirects=False) as response:
+                        response.raise_for_status()
+                        if response.status_code != 200:
+                            raise ValueError('Model server returned a redirect or unexpected response')
+                        with archive.open('wb') as stream:
+                            for block in response.iter_content(1024 * 256):
+                                size += len(block)
+                                if size > 100 * 1024 * 1024:
+                                    raise ValueError('Wake model archive exceeds the size limit')
+                                stream.write(block)
+                    with zipfile.ZipFile(archive) as package:
+                        if sum(item.file_size for item in package.infolist()) > 250 * 1024 * 1024:
+                            raise ValueError('Expanded wake model exceeds the size limit')
+                        for item in package.infolist():
+                            name = Path(item.filename)
+                            destination = (MODEL_DIR.parent / name).resolve()
+                            if (name.is_absolute() or not name.parts or name.parts[0] != MODEL_NAME
+                                    or not destination.is_relative_to(MODEL_DIR.resolve())
+                                    or ':' in item.filename or '\\' in item.filename
+                                    or (item.external_attr >> 16) & 0o170000 == 0o120000):
+                                raise ValueError('Unsafe model archive path')
+                        package.extractall(MODEL_DIR.parent)
+            return (True, 'Custom wake recognizer installed. Audio stays local.') if is_ready() else (False, 'Wake model files are incomplete')
+        except Exception as exc:
+            return False, 'Custom wake setup failed: ' + str(exc)
 
 
 class WakeWordDetector:
-    """
-    Runs the wake model in a dedicated thread. The mic thread calls feed() with
-    raw int16 frames; detections invoke on_detect() (called from this thread —
-    the callback must marshal to whatever loop/UI it needs).
-    """
-
-    def __init__(self, on_detect: Callable[[], None],
-                 threshold: float = DEFAULT_THRESHOLD,
-                 logger: Callable[[str], None] = print,
-                 notify: Callable[[str], None] | None = None):
-        self._on_detect = on_detect
+    def __init__(self, on_detect, threshold=DEFAULT_THRESHOLD, logger=print, notify=None,
+                 phrase=DEFAULT_PHRASE, fallback_enabled=True):
+        self._on_detect, self._logger = on_detect, logger
+        self._notify = notify or (lambda _: None)
         self._threshold = threshold
-        self._logger    = logger
-        # See PluginRegistry: `logger` is the console and gets everything,
-        # `notify` is the activity log and gets only what the user must act on.
-        self._notify    = notify or (lambda _msg: None)
-        self._queue: queue.Queue = queue.Queue(maxsize=50)
-        self._thread: threading.Thread | None = None
-        self._running = False
+        self._queue = queue.Queue(maxsize=20)
+        self._lock = threading.RLock()
+        self._thread = None
         self._model = None
-        self._ready = False
-
-    def start(self) -> bool:
-        """Load the model and spawn the inference thread. Returns True on success.
-        Safe to call again — a no-op if already running. Never raises."""
-        if self._running:
-            return True
-        try:
-            from openwakeword.model import Model
-            self._model = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
-        except Exception as e:
-            self._logger(f"Wake word: could not load model — {e}")
-            self._notify("Wake word unavailable — use the WAKE NOW button.")
-            self._model = None
-            return False
-        self._running = True
-        self._ready = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="WakeWordThread")
-        self._thread.start()
-        self._logger("Wake word: listening for 'Hey Jarvis'.")
-        return True
-
-    def stop(self) -> None:
-        self._running = False
-        # unblock the thread if it's waiting on the queue
-        try:
-            self._queue.put_nowait(None)
-        except Exception:
-            pass
-        self._model = None
-        self._ready = False
+        self._ready = self._running = False
+        self._armed = True
+        self._generation = 0
+        self._phrase, self._fallback = validate(phrase), bool(fallback_enabled)
+        self._last_detect = float('-inf')
 
     @property
-    def ready(self) -> bool:
+    def ready(self):
         return self._ready
 
-    def feed(self, frame_int16) -> None:
-        """Called from the mic callback (real-time thread). Must stay cheap and
-        never block — the frame is copied and dropped if the queue is backed up."""
-        if not self._running:
+    def configure(self, phrase, fallback_enabled):
+        phrase = validate(phrase)
+        with self._lock:
+            if self._model:
+                self._check_vocabulary(phrase, fallback_enabled)
+            self._phrase, self._fallback = phrase, bool(fallback_enabled)
+            self._generation += 1
+            self._drain()
+
+    def set_listening(self, enabled):
+        with self._lock:
+            self._armed = bool(enabled)
+            self._generation += 1
+            self._drain()
+
+    def _check_vocabulary(self, phrase, fallback):
+        phrases = recognition_phrases(phrase, fallback)
+        valid = [text for text in phrases if all(self._model.vosk_model_find_word(word) >= 0 for word in text.split())]
+        if not any(matches(text, phrase, False) for text in valid):
+            raise ValueError('Wake phrase has words missing from the offline English model; choose ordinary English words')
+        if fallback and 'hey jarvis' not in valid:
+            raise ValueError('The offline model does not support the Hey Jarvis fallback')
+        return valid
+
+    def start(self):
+        with self._lock:
+            if self._running:
+                return True
+            if self._thread and self._thread.is_alive():
+                self._notify('Previous wake worker is still stopping; retry shortly')
+                return False
+            try:
+                if not is_ready():
+                    raise RuntimeError('Custom wake model is not installed; use WAKE WORD: DOWNLOAD')
+                if str(RUNTIME_DIR) not in sys.path:
+                    sys.path.insert(0, str(RUNTIME_DIR))
+                from vosk import Model, SetLogLevel
+                SetLogLevel(-1)
+                self._model = Model(str(MODEL_DIR))
+                self._check_vocabulary(self._phrase, self._fallback)
+                self._running = self._ready = self._armed = True
+                self._thread = threading.Thread(target=self._loop, daemon=True, name='CustomWakeThread')
+                self._thread.start()
+                self._logger('Local wake detector ready for: ' + self._phrase)
+                return True
+            except Exception as exc:
+                self._model = None
+                self._notify('Wake detector unavailable: ' + str(exc) + '. Use WAKE NOW.')
+                return False
+
+    def stop(self):
+        with self._lock:
+            self._running = self._ready = False
+            self._armed = False
+            self._generation += 1
+            self._drain()
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+        if not self._thread or not self._thread.is_alive():
+            self._model = None
+
+    def feed(self, frame_int16):
+        if not self._running or not self._armed:
             return
         try:
-            # frame_int16 is a numpy int16 array (possibly 2-D mono) — flatten to 1-D
-            data = frame_int16[:, 0].copy() if getattr(frame_int16, "ndim", 1) > 1 else frame_int16.copy()
-            self._queue.put_nowait(data)
-        except queue.Full:
-            pass
-        except Exception:
+            data = frame_int16[:, 0] if getattr(frame_int16, 'ndim', 1) > 1 else frame_int16
+            self._queue.put_nowait((self._generation, data.copy().tobytes()))
+        except (queue.Full, AttributeError):
             pass
 
-    def _loop(self) -> None:
-        import numpy as np
+    def _accept(self, result, generation):
+        """Final text only; confidence + full-phrase match + one wake per arm."""
+        text, words = result.get('text', ''), result.get('result', [])
+        confidence = [float(word.get('conf', 0)) for word in words]
+        # Grammar alternatives such as daddy's/daddies share acoustic evidence.
+        # Require a strong complete phrase, not .75 on every homophone token.
+        if not confidence or min(confidence) < .35 or sum(confidence) / len(confidence) < self._threshold:
+            return False
+        with self._lock:
+            if (not self._running or not self._armed or generation != self._generation
+                    or time.monotonic() - self._last_detect < 1.5
+                    or not matches(text, self._phrase, self._fallback)):
+                return False
+            self._armed = False
+            self._last_detect = time.monotonic()
+            self._drain()
+            self._on_detect()
+            return True
+
+    def _loop(self):
+        from vosk import KaldiRecognizer
+        recognizer, generation = None, -1
         while self._running:
+            item = self._queue.get()
+            if item is None:
+                return
+            current, data = item
             try:
-                frame = self._queue.get()
-                if frame is None or not self._running:
-                    break
-                scores = self._model.predict(np.asarray(frame, dtype=np.int16))
-                score = 0.0
-                if isinstance(scores, dict):
-                    # match the jarvis model regardless of exact key suffix
-                    for k, v in scores.items():
-                        if "jarvis" in k.lower():
-                            score = max(score, float(v))
-                    if score == 0.0 and scores:
-                        score = max(float(v) for v in scores.values())
-                if score >= self._threshold:
-                    # drain any backlog so we don't double-fire on the same utterance
-                    self._drain()
-                    try:
-                        self._on_detect()
-                    except Exception as e:
-                        self._logger(f"Wake word: on_detect error — {e}")
-            except Exception as e:
-                self._logger(f"Wake word: inference error — {e}")
+                with self._lock:
+                    if current != self._generation or not self._armed:
+                        continue
+                    if current != generation:
+                        grammar = self._check_vocabulary(self._phrase, self._fallback) + ['[unk]']
+                        recognizer = KaldiRecognizer(self._model, SAMPLE_RATE, json.dumps(grammar))
+                        recognizer.SetWords(True)
+                        generation = current
+                if recognizer.AcceptWaveform(data):
+                    self._accept(json.loads(recognizer.Result()), current)
+            except Exception as exc:
+                self._logger('Local wake detection error: ' + str(exc))
 
-    def _drain(self) -> None:
+    def _drain(self):
         try:
             while True:
                 self._queue.get_nowait()
-        except Exception:
+        except queue.Empty:
             pass

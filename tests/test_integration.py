@@ -29,6 +29,9 @@ class DispatchTests(Isolated):
         exec(compile(module, str(source), "exec"), env)
         host = env["Host"]()
         host._automation = self.runtime
+        from actions.open_app import TOOL as open_declaration
+        from actions.computer_control import TOOL as close_declaration
+        self.runtime.catalog_provider = lambda: [open_declaration, close_declaration]
         host.ui = Mock(muted=True, current_file=None)
         host.speak = Mock()
         host.speak_error = Mock()

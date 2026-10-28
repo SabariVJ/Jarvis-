@@ -190,12 +190,33 @@ class PipelineEngine:
             if fd:
                 decls.extend(fd)
 
+        self._available_declarations = list(decls)
         self._declarations = schema.budget(
             decls,
             max_tools=self.caps.get("max_tools"),
             max_chars=self.caps.get("max_tool_chars"),
         )
-        fmt = self.caps.get("tool_format")
+        self._base_system = self._system
+        self._refresh_tool_policy()
+
+        kept, total = len(self._declarations), len(decls)
+        if kept < total:
+            self._log(f"SYS: {kept} of {total} tools declared "
+                      f"({schema.payload_size(self._declarations):,} chars) — "
+                      f"this model's budget.")
+
+    def _refresh_tool_policy(self):
+        fmt = self.caps.get('tool_format')
+        from core.git_capabilities import capability_policy
+        self._system = self._base_system + capability_policy(self._declarations if self.caps.get('tools') else [])
+        from core.calling_intents import capability_policy as calling_policy
+        provider = getattr(getattr(self, '_runtime', None), 'catalog_provider', None)
+        available = provider() if callable(provider) else getattr(self, '_available_declarations', self._declarations)
+        self._system += calling_policy(available if self.caps.get('tools') else [])
+        names = self.tool_names() if self.caps.get('tools') else []
+        self._system += ('\n[CURRENT SESSION TOOL INVENTORY]\nCallable tools: ' + ', '.join(names)
+                         + '\nThese current declarations supersede earlier capability lists. An installed/enabled tool '
+                           'may be omitted by the engine budget; omission is not uninstallation. Never claim success without its result.\n')
         if not self.caps.get("tools") or not self._declarations:
             self._tools = None
         elif fmt == "prompt":
@@ -208,12 +229,6 @@ class PipelineEngine:
             self._tools = None
         else:
             self._tools = schema.convert(self._declarations, fmt)
-
-        kept, total = len(self._declarations), len(decls)
-        if kept < total:
-            self._log(f"SYS: {kept} of {total} tools declared "
-                      f"({schema.payload_size(self._declarations):,} chars) — "
-                      f"this model's budget.")
 
     def tool_names(self) -> list[str]:
         """What the model was actually offered. main.py uses this to decide what
@@ -406,6 +421,8 @@ class PipelineEngine:
 
     async def close(self) -> None:
         self._closed = True
+        if self._runtime:
+            self._runtime.clear_calling_context()
         if self._gen and not self._gen.done():
             self._gen.cancel()
         await self._queue.put(None)
@@ -471,20 +488,81 @@ class PipelineEngine:
         epoch = self._command_epoch if epoch is None else epoch
         context = dict(self._command_context) if context is None else context
         _EMISSION_CONTEXT.set((epoch, context))
+        if self._history and self._history[-1].get('role') == 'tool':
+            name = self._history[-1].get('name')
+            summary = None
+            if name == 'calling_assistant':
+                from core.calling_intents import summarize
+                summary = summarize(self._history[-1].get('content'))
+            elif name == 'whatsapp_control':
+                from plugins.whatsapp_control import summarize
+                summary = summarize(self._history[-1].get('content'))
+            if summary:
+                self._history.append({'role': 'assistant', 'content': summary})
+                await self._emit(Msg.said(summary))
+                await self._speak(summary)
+                await self._emit(Msg.turn_end())
+                return
+        if self._history and self._history[-1].get('role') == 'tool':
+            name = self._history[-1].get('name')
+            if name in {'calling_manager', 'codex_assistant'}:
+                from plugins import calling_manager, codex_assistant
+                narrator = calling_manager if name == 'calling_manager' else codex_assistant
+                summary = narrator.summarize(self._history[-1].get('content'))
+                if summary:
+                    self._history.append({'role': 'assistant', 'content': summary})
+                    await self._emit(Msg.said(summary))
+                    await self._speak(summary)
+                    await self._emit(Msg.turn_end())
+                    return
+        if self._history and self._history[-1].get('role') == 'tool' and self._history[-1].get('name') == 'wake_settings':
+            from plugins.wake_settings import summarize
+            summary = summarize(self._history[-1].get('content'))
+            if summary:
+                self._history.append({'role': 'assistant', 'content': summary})
+                await self._emit(Msg.said(summary))
+                await self._speak(summary)
+                await self._emit(Msg.turn_end())
+                return
+        # A diagnostic is already structured evidence, not another opportunity
+        # for a model to deny the capability that just executed successfully.
+        if self._history and self._history[-1].get('role') == 'tool' and self._history[-1].get('name') == 'github_git':
+            from core.git_capabilities import diagnostic_summary
+            summary = diagnostic_summary(self._history[-1].get('content'))
+            if summary:
+                self._history.append({'role': 'assistant', 'content': summary})
+                await self._emit(Msg.said(summary))
+                await self._speak(summary)
+                await self._emit(Msg.turn_end())
+                return
         # Local STT already provides text, so exact app-launch requests need no
         # reasoning round-trip. Gemini Live audio remains on its native path.
-        if (self._fast_commands and self.caps.get("tools") and self._rounds == 0
+        if (self.caps.get("tools") and self._rounds == 0
                 and self._history and self._history[-1].get("role") == "user"):
-            from core.command_router import plan, git_route
+            from core.command_router import recognize, resolve
             request = _text_of(self._history[-1].get('content', ''))
-            quick_git = git_route(request)
-            steps = plan(request) or ([quick_git] if quick_git else None)
+            provider = getattr(self._runtime, 'catalog_provider', None)
+            routing_catalog = provider() if callable(provider) else self._declarations
+            if not self._fast_commands:
+                routing_catalog = [tool for tool in routing_catalog if tool.get('name') not in {'open_app', 'computer_control'}]
+            candidate = resolve(request, routing_catalog, self._runtime, context)
+            if candidate:
+                required = tuple(dict.fromkeys(name for name, _ in candidate))
+                declarations = {tool['name']: tool for tool in self._declarations}
+                declarations.update({tool['name']: tool for tool in routing_catalog if tool['name'] in required})
+                candidates = [{**tool, 'tier': 'core'} if tool['name'] in required else tool for tool in declarations.values()]
+                selected = schema.budget(candidates, max_tools=self.caps.get('max_tools'),
+                    max_chars=self.caps.get('max_tool_chars'), core_names=tuple(dict.fromkeys(required + schema.CORE_TOOLS)))
+                if set(required) <= {tool['name'] for tool in selected}:
+                    self._declarations = selected
+                    self._refresh_tool_policy()
+                else:
+                    routing_catalog = []  # Budget cannot represent the complete route; plan instead.
+            steps = recognize(request, routing_catalog, self._runtime, context)
             if steps and all(name in self.tool_names() for name, _ in steps):
                 import uuid
                 calls = [FunctionCall(id=uuid.uuid4().hex, name=name, args=args) for name, args in steps]
-                acknowledgement = 'Checking the project repository.' if quick_git else ('I will run those app actions in order.' if len(steps) > 1 else (
-                    ('Opening ' if steps[0][0] == 'open_app' else 'Closing ') + steps[0][1]['app_name'] + '.')
-                )
+                acknowledgement = 'Running the requested steps in order.' if len(steps) > 1 else 'Checking the requested action.'
                 await self._emit(Msg.said(acknowledgement))
                 await self._speak(acknowledgement)
                 self._rounds = 1

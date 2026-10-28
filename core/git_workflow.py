@@ -114,6 +114,44 @@ class GitWorkflow:
         return {'project': str(self.root), 'branch': self.branch(), 'commit': self.head(),
                 'status': self.git('status', '--short', '--branch').stdout, 'pushed': False}
 
+    def branches(self):
+        current = self.git('symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
+        return {'current_branch': current.stdout.strip() if not current.returncode else None,
+                'detached_head': bool(current.returncode),
+                'branches': self.git('branch', '--list', '--no-color').stdout}
+
+    def remotes(self):
+        # Redact userinfo/tokens even in malformed legacy remote configuration.
+        text = self.git('remote', '-v').stdout
+        text = re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s@]+@', r'\1[redacted]@', text)
+        text = re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://[^\s?#]+)[?#][^\s]*', r'\1[redacted-query]', text)
+        return {'remotes': redact(text)}
+
+    def log(self):
+        if not self.head():
+            return {'commits': [], 'note': 'Repository has no commits yet'}
+        return {'commits': redact(self.git('log', '-10', '--format=%h %s').stdout)}
+
+    def connectivity(self, remote='origin'):
+        data = {'git_tool_enabled': True, 'local_repository': True, 'project': str(self.root),
+                **self.branches(), **self.remotes(), 'remote_name': remote,
+                'remote_read_access_verified': False, 'authentication': 'not_verified',
+                'push_permission': 'not_verified', 'github_api': 'not_tested_by_git_cli',
+                'browser_login': 'not_inspected_not_evidence_of_git_authentication'}
+        try:
+            url, repository = self.destination(remote)
+            data.update(remote_url=url, repository=repository)
+            # Read-only network probe. Existing destination validation rejects
+            # URL rewrites/custom SSH commands; credentials remain with Git/GCM.
+            branch = data['current_branch'] or 'HEAD'
+            data['remote_branch_commit'] = self.remote_head(url, branch)
+            data['remote_read_access_verified'] = True
+            data['note'] = ('Remote read access verified; public repositories may allow anonymous reads. '
+                            'This does not verify credential identity or permission to push.')
+        except ValueError as exc:
+            data['failure'] = redact(str(exc))
+        return data
+
     def review(self, files):
         if not isinstance(files, list) or not 1 <= len(files) <= 100 or len(files) != len(set(files)):
             raise ValueError('Select 1–100 explicit, unique project-relative files; no wildcard staging')

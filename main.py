@@ -75,6 +75,7 @@ from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
     get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_wake_config, save_wake_config,
 )
 from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
@@ -690,8 +691,13 @@ class JarvisLive:
         self._automation = get_runtime()
         self._automation.dispatch = self._dispatch_automation
         self._automation.notify = lambda message: self.ui.write_log(f"SYS: {message}")
+        self._automation.dashboard_notify = lambda message: self.ui.write_log(f"SYS: {message}")
+        self._automation.desktop_notify = self.ui.desktop_notification
+        self._automation.local_speech = self._announce_local
         self._automation.catalog = (self._action_registry.get_tool_declarations()
                                     + self._plugin_registry.get_tool_declarations())
+        self._automation.catalog_provider = lambda: (self._action_registry.get_tool_declarations()
+                                                     + self._plugin_registry.get_tool_declarations())
         self._tool_tasks = set()
         from plugins.task_manager import start_scheduler
         start_scheduler(self._automation)
@@ -717,6 +723,9 @@ class JarvisLive:
         self.ui.wake_get_state   = self._wake_state       # () -> dict
         self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
+        self.ui.on_wake_phrase = self._ui_wake_phrase
+        self._automation.configure_wake = self._ui_wake_phrase
+        self._automation.wake_state = self._wake_state
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
 
     # ── Wake word: state machine ─────────────────────────────────────────────
@@ -725,7 +734,7 @@ class JarvisLive:
         # A loaded, running detector is definitively ready; otherwise fall back
         # to the cheap on-disk model-file check (no Model construction).
         ready = bool(self._wake_detector and self._wake_detector.ready) or wake_is_ready()
-        return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready}
+        return {"enabled": self._wake_enabled, "awake": self._awake, "ready": ready, **get_wake_config()}
 
     def _ensure_wake_detector(self) -> bool:
         """Load the detector once (model loads on first start). Idempotent."""
@@ -734,19 +743,22 @@ class JarvisLive:
                 on_detect=self._on_wake_detected,
                 logger=lambda m: print(f"[Wake] {m}"),
                 notify=lambda m: self.ui.write_log(f"SYS: {m}"),
+                phrase=get_wake_config()['phrase'], fallback_enabled=get_wake_config()['fallback_enabled'],
             )
         if not self._wake_detector.ready:
             return self._wake_detector.start()
         return True
 
     def _on_wake_detected(self) -> None:
-        """Called from the detector thread when 'Hey Jarvis' is heard."""
+        """Called once for a matched, armed local wake phrase."""
         self.wake(reason="wake word")
 
     def wake(self, reason: str = "wake word") -> None:
         if self._awake:
             return
         self._awake = True
+        if self._wake_detector:
+            self._wake_detector.set_listening(False)
         self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -756,9 +768,11 @@ class JarvisLive:
         if not self._awake:
             return
         self._awake = False
+        if self._wake_detector:
+            self._wake_detector.set_listening(True)
         self.set_speaking(False)
         self.ui.set_state("SLEEPING")
-        self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
+        self.ui.write_log(f"SYS: Sleeping — {reason}. Say {get_wake_config()['phrase']!r} to wake me.")
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
@@ -775,20 +789,37 @@ class JarvisLive:
 
     # ── Wake word: UI callbacks (called from the Qt thread) ──────────────────
 
+    def _ui_wake_phrase(self, phrase, fallback_enabled):
+        previous = get_wake_config()
+        detector = self._wake_detector
+        if detector:
+            detector.configure(phrase, fallback_enabled)
+        try:
+            selected = save_wake_config(phrase, fallback_enabled)
+        except Exception:
+            if detector:
+                detector.configure(previous['phrase'], previous['fallback_enabled'])
+            raise
+        self.ui.write_log(f"SYS: Wake phrase saved: {selected['phrase']!r}. Hey Jarvis fallback: {selected['fallback_enabled']}.")
+        return selected
+
     def _ui_wake_toggle(self, enable: bool) -> str:
         """Enable/disable wake word from the settings UI. Returns a status token:
         'enabled' | 'disabled' | 'need_download'."""
         if enable:
             if not wake_is_ready():
                 return "need_download"
+            if not self._ensure_wake_detector():
+                return 'unavailable'
             self._wake_enabled = True
             save_wake_word_enabled(True)
-            self._ensure_wake_detector()
             self.sleep(reason="wake word enabled")
             return "enabled"
         else:
             self._wake_enabled = False
             save_wake_word_enabled(False)
+            if self._wake_detector:
+                self._wake_detector.stop()
             self.wake(reason="wake word disabled")
             return "disabled"
 
@@ -807,6 +838,39 @@ class JarvisLive:
         # what they are waiting to see.
         return wake_install(logger=lambda m: print(f"[Wake] {m}"),
                             notify=lambda m: self.ui.write_log(f"SYS: {m}"))
+
+    def _announce_local(self, text):
+        """Optional offline SAPI alert. Never use Gemini/model inference for it."""
+        if not getattr(self, '_awake', False) or self.ui.muted:
+            return False
+        with self._speaking_lock:
+            if self._is_speaking:
+                return False
+            self._is_speaking = True
+        cancel = threading.Event()
+        self._local_speech_cancel = cancel
+        initialized = False
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+            initialized = True
+            import win32com.client
+            self.set_speaking(True)
+            voice = win32com.client.Dispatch('SAPI.SpVoice')
+            voice.Speak(str(text).split('Results:', 1)[0][:240], 1)
+            deadline = time.monotonic() + 15
+            while voice.Status.RunningState == 2:
+                if cancel.is_set() or self.ui.muted or not self._awake or time.monotonic() >= deadline:
+                    voice.Speak('', 3)
+                    return False
+                time.sleep(.05)
+            return True
+        finally:
+            self.set_speaking(False)
+            if not self._awake:
+                self.ui.set_state('SLEEPING')
+            if initialized:
+                pythoncom.CoUninitialize()
 
     def plugin_say(self, instruction: str) -> None:
         """
@@ -937,7 +1001,7 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         context = self._automation.new_turn(text, source='typed')
         if text.strip().casefold().rstrip('.!') in {"stop", "stop jarvis", "cancel task", "stop all tasks"}:
-            self.interrupt()
+            self.interrupt(all_jobs=text.strip().casefold().rstrip('.!') == 'stop all tasks')
             return
         if not self._loop or not self.session:
             return
@@ -945,11 +1009,10 @@ class JarvisLive:
         # asleep either (the sleep gate is not just for the mic). Wake first with
         # "Hey Jarvis" or the WAKE NOW button.
         if self._wake_enabled and not self._awake:
-            self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
+            self.ui.write_log(f"SYS: I'm asleep — say {get_wake_config()['phrase']!r} or tap WAKE NOW first.")
             return
-        from core.command_router import plan, git_route
-        quick_git = git_route(text)
-        steps = plan(text) or ([quick_git] if quick_git else None)
+        from core.command_router import recognize
+        steps = recognize(text, self._automation.catalog_provider(), self._automation, context)
         session = self.session
         if steps:
             async def execute_quick():
@@ -962,9 +1025,14 @@ class JarvisLive:
                         if session is not self.session:
                             raise InterruptedError('Session changed before the app action')
                         step_context = {**context, 'request_id': uuid.uuid4().hex, 'step_id': str(index)}
+                        self._automation.trace('dispatch_submitted', step_context, name)
                         result = await asyncio.to_thread(self._dispatch_automation, name, args, step_context)
                         results.append(result)
                         self.ui.write_log(f"JARVIS: {result}")
+                        self._automation.report_outcome(step_context, 'typed_activity_log')
+                        if not outcome.is_verified(result):
+                            self.ui.write_log('SYS: Dependent steps stopped: the previous outcome was not verified.')
+                            break
                     self._automation.finish(context)
                     if context['execution_id'] == self._automation.context().get('execution_id') and session is self.session:
                         self.plugin_say('These requested actions have finished. Report each actual result briefly; '
@@ -1044,8 +1112,7 @@ class JarvisLive:
             # Holding the key is also a way to wake it, so push-to-talk works
             # without having to say the wake word first.
             if self._wake_enabled and not self._awake:
-                self._awake = True
-                self._last_user_speech = time.monotonic()
+                self.wake(reason='push-to-talk')
         # Releasing the key ends the turn. On Live the server works that out from
         # the audio; a local pipeline has no server, so the release IS the
         # signal — which is also why it is the more reliable of the two ways to
@@ -1076,9 +1143,12 @@ class JarvisLive:
         except Exception:
             pass
 
-    def interrupt(self) -> None:
+    def interrupt(self, *, all_jobs=False) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
-        self._automation.cancel()
+        cancel = getattr(self, '_local_speech_cancel', None)
+        if cancel:
+            cancel.set()
+        self._automation.cancel(all_jobs=all_jobs)
         self._interrupted = True
         q = self.audio_in_queue
         if q:
@@ -1216,6 +1286,13 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        parts.append('Wake phrases are configurable using the local wake_settings tool. Query it for current '
+                     'settings; set only on a fresh explicit user request. Never search the web to change a wake phrase '
+                     'or claim this installed capability is impossible. Sleeping audio is handled locally, not by you.')
+        from core.git_capabilities import capability_policy
+        parts.append(capability_policy(_all_decls))
+        from core.calling_intents import capability_policy as calling_policy
+        parts.append(calling_policy(_all_decls))
 
         cfg = dict(
             response_modalities=["AUDIO"],
@@ -1329,6 +1406,47 @@ class JarvisLive:
             return self._plugin_registry.run(name, args, player=self.ui, session_memory=context)
         return self._automation.execute(name, args, invoke, context)
 
+    def _route_final_whatsapp_call(self):
+        """Final native speech only; audio recognition itself stays provider-mediated."""
+        if not self.session or not self._awake:
+            return False
+        from core.calling_intents import claim_live_call
+        context = self._automation.context()
+        try:
+            steps = claim_live_call(self._automation, context, self._automation.catalog_provider())
+            if not steps:
+                return False
+            context = self._automation.admit_batch(context)
+        except (InterruptedError, ValueError) as exc:
+            self._automation.trace('live_call_route_rejected', context, reason=str(exc))
+            return False
+        session = self.session
+        async def dispatch():
+            try:
+                if not hasattr(self, '_tool_batch_lock'):
+                    self._tool_batch_lock = asyncio.Lock()
+                async with self._tool_batch_lock:
+                    self._automation.check_cancelled(context)
+                    if session is not self.session:
+                        raise InterruptedError('Session changed before call dispatch; not replayed')
+                    name, args = steps[0]
+                    self.ui.write_log('SYS: Final explicit WhatsApp call request routed; verifying recipient.')
+                    result = await asyncio.to_thread(self._dispatch_automation, name, args, context)
+                    from plugins.whatsapp_control import summarize
+                    summary = summarize(result)
+                    self.ui.write_log('JARVIS: ' + summary)
+                    self._automation.report_outcome(context, 'live_call_activity_log')
+                    if session is self.session and context['execution_id'] == self._automation.context().get('execution_id'):
+                        self.plugin_say('Local WhatsApp tool receipt. Report only this outcome; do not invent confirmation, permission or connection: ' + summary)
+            except Exception as exc:
+                self.ui.write_log('ERR: WhatsApp call dispatch stopped: ' + str(exc))
+            finally:
+                self._automation.release_batch(context)
+        task = asyncio.create_task(dispatch())
+        self._tool_tasks.add(task)
+        task.add_done_callback(self._tool_tasks.discard)
+        return True
+
     async def _handle_tool_batch(self, calls, session, context):
         try:
             if not hasattr(self, '_tool_batch_lock'):
@@ -1361,6 +1479,17 @@ class JarvisLive:
         self._automation.trace('tool_invocation', execution_context, name)
         try:
             self._automation.check_cancelled(execution_context)
+            if (name == 'whatsapp_control' and str(args.get('action', '')).endswith('_call')
+                    and (execution_context.get('command_source') or execution_context.get('source')) == 'speech_live'
+                    and not execution_context.get('input_final')):
+                # A partial native transcript is not a call attempt. Reject it
+                # before binding/inserting an execution receipt: otherwise the
+                # final explicit request could inherit a cached authorization
+                # failure. No old tool request is queued or retried.
+                self._automation.trace('call_deferred_unfinished_transcript', execution_context, name)
+                return types.FunctionResponse(id=fc.id, name=name, response={'result': outcome.failed(
+                    name, 'Native user transcript is incomplete; no call attempted. This is not an external permission dialog.',
+                    state='transcript_incomplete', call_initiation_attempted=False)})
             self._automation.bind_model_call(name, args, execution_context)
         except InterruptedError as exc:
             return types.FunctionResponse(id=fc.id, name=name, response={'result': outcome.failed(name, str(exc))})
@@ -1786,10 +1915,18 @@ class JarvisLive:
                                         self._automation.new_turn(txt, source='speech_live')
                                         input_execution = self._automation.context().get('execution_id')
                                 in_buf.append(txt)
-                                self._automation.update_turn_text(' '.join(in_buf))
+                                self._automation.update_turn_text(' '.join(in_buf), final=bool(getattr(sc.input_transcription, 'finished', False)))
+                                if bool(getattr(sc.input_transcription, 'finished', False)) and not getattr(response, 'automation_context', None):
+                                    self._route_final_whatsapp_call()
                                 self._last_user_speech = time.monotonic()
                                 if " ".join(in_buf).strip().casefold().rstrip('.!') in {"stop", "stop jarvis", "cancel task", "stop all tasks"}:
-                                    self.interrupt()
+                                    self.interrupt(all_jobs=" ".join(in_buf).strip().casefold().rstrip('.!') == 'stop all tasks')
+
+                        if (sc.input_transcription and not sc.input_transcription.text and in_buf
+                                and bool(getattr(sc.input_transcription, 'finished', False))):
+                            self._automation.update_turn_text(' '.join(in_buf), final=True)
+                            if not getattr(response, 'automation_context', None):
+                                self._route_final_whatsapp_call()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -1825,6 +1962,7 @@ class JarvisLive:
                                 if full_out in self._last_out_logged:
                                     full_out = ""
                             if full_out:
+                                self._automation.report_outcome(response_context or self._automation.context(), 'assistant_transcript')
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
@@ -2525,6 +2663,7 @@ class JarvisLive:
                     session.send_client_content = _send_and_arm
 
                     self.session          = session
+                    self._automation.clear_calling_context()
                     import uuid
                     if getattr(self, '_automation_session_id', None):
                         self._automation.finish(self._automation.context(), 'interrupted')
@@ -2556,8 +2695,10 @@ class JarvisLive:
                     if self._wake_enabled:
                         self._ensure_wake_detector()
                         self._awake = False
+                        if self._wake_detector:
+                            self._wake_detector.set_listening(True)
                         self.ui.set_state("SLEEPING")
-                        self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
+                        self.ui.write_log(f"SYS: JARVIS online — sleeping. Say {get_wake_config()['phrase']!r} to wake me.")
                     else:
                         self._awake = True
                         self.ui.set_state("LISTENING")

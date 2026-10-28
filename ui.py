@@ -50,8 +50,8 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
     print(f"[Video] playback unavailable ({_e}) — the HUD will not show video.")
 
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QDialog, QCheckBox,
+    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter, QSystemTrayIcon, QStyle,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QSlider,
 )
@@ -4236,6 +4236,7 @@ class RemoteKeyOverlay(QWidget):
 
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
+    _desktop_notice_sig = pyqtSignal(str, str)
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
@@ -4256,6 +4257,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, face_path: str):
         super().__init__()
+        self._desktop_notice_sig.connect(self._desktop_notice)
         self._face_path = face_path
 
         # Load customization from config
@@ -4288,6 +4290,7 @@ class MainWindow(QMainWindow):
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
+        self.on_wake_phrase = None
         self.on_push_to_talk   = None   # callable: (enable: bool) -> str scope
         self.ptt_hold          = None   # callable: (held: bool) -> None — windowed chord
         self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
@@ -5614,6 +5617,18 @@ class MainWindow(QMainWindow):
         self._wake_btn.setStyleSheet(self._BTN_DIM)
         self._wake_sleep_btn.hide()
 
+        self._wake_phrase_btn = _row(QPushButton('⚙  WAKE PHRASE…'), self._BTN_DIM)
+        self._wake_phrase_btn.clicked.connect(self._edit_wake_phrase)
+
+        self._calling_btn = _row(QPushButton('☎  CALLING…'), self._BTN_DIM)
+        self._calling_btn.clicked.connect(self._show_calling)
+
+        self._tasks_btn = _row(QPushButton('✓  TASKS & ALERTS…'), self._BTN_DIM)
+        self._tasks_btn.clicked.connect(self._show_tasks)
+
+        self._github_btn = _row(QPushButton('◇  GITHUB COMMAND CENTER…'), self._BTN_DIM)
+        self._github_btn.clicked.connect(self._show_github)
+
         self._ptt_btn = _row(QPushButton())
         self._ptt_btn.clicked.connect(self._toggle_ptt)
         self._refresh_talk_btns()
@@ -6377,7 +6392,8 @@ class MainWindow(QMainWindow):
                 s = self.wake_get_state()
                 return {"ready": bool(s.get("ready")),
                         "enabled": bool(s.get("enabled")),
-                        "awake": bool(s.get("awake"))}
+                        "awake": bool(s.get("awake")), 'phrase': s.get('phrase', ''),
+                        'fallback_enabled': s.get('fallback_enabled', True)}
             except Exception:
                 pass
         # Before JarvisLive has wired its callback (drawer built at startup).
@@ -6388,12 +6404,14 @@ class MainWindow(QMainWindow):
             ready, enabled = is_ready(), get_wake_word_enabled()
         except Exception:
             pass
-        return {"ready": ready, "enabled": enabled, "awake": True}
+        from memory.config_manager import get_wake_config
+        return {"ready": ready, "enabled": enabled, "awake": True, **get_wake_config()}
 
     def _refresh_wake_btns(self):
         if not hasattr(self, '_wake_btn'):
             return
         st = self._wake_state()
+        self._wake_btn.setToolTip('Wake phrase: ' + st.get('phrase', ''))
         _on = f"""
             QPushButton {{ background: #001a08; color: {C.GREEN};
                 border: 1px solid {C.GREEN_D}; border-radius: 3px;
@@ -6408,7 +6426,8 @@ class MainWindow(QMainWindow):
         if not st["ready"]:
             self._wake_btn.setText("⬇  WAKE WORD: DOWNLOAD")
             self._wake_btn.setStyleSheet(_off)
-            self._wake_sleep_btn.hide()
+            self._wake_sleep_btn.setVisible(st['enabled'])
+            self._wake_sleep_btn.setText('😴  SLEEP NOW' if st['awake'] else '👂  WAKE NOW')
         elif st["enabled"]:
             self._wake_btn.setText("🎙  WAKE WORD: ON")
             self._wake_btn.setStyleSheet(_on)
@@ -6542,6 +6561,116 @@ class MainWindow(QMainWindow):
                 cb(bool(held))
             except Exception:
                 pass
+
+    def _desktop_notice(self, title, message):
+        if not QSystemTrayIcon.isSystemTrayAvailable() or not QSystemTrayIcon.supportsMessages():
+            self._log_sig.emit('SYS: Windows notification service unavailable; see task alerts.')
+            return
+        if not getattr(self, '_notice_tray', None):
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self._notice_tray = QSystemTrayIcon(icon, self)
+            self._notice_tray.setToolTip('JARVIS task notifications')
+            self._notice_tray.show()
+        self._notice_tray.showMessage(title[:80], message[:600], QSystemTrayIcon.MessageIcon.Information, 10000)
+
+    def _show_github(self):
+        from core.automation_runtime import get_runtime
+        from core.guardian_panel import build
+        def submit(text):
+            self._input.setText(text)
+            self._send()
+        build(self, get_runtime(), submit, C).exec()
+
+    def _show_tasks(self):
+        import json
+        from core.automation_runtime import get_runtime
+        dialog = QDialog(self)
+        dialog.setWindowTitle('JARVIS Tasks & Alerts — local only')
+        dialog.setMinimumSize(620, 480)
+        dialog.setStyleSheet(f'QDialog {{ background: {C.DARK}; }} QLabel {{ color: {C.TEXT}; }}')
+        layout = QVBoxLayout(dialog)
+        label = QLabel('Review progress and result paths. Notification channels: Settings → Plugin Settings → Free task notifications.')
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        display = QTextEdit()
+        display.setReadOnly(True)
+        display.setObjectName('task_alerts_status')
+        layout.addWidget(display)
+        refresh = QPushButton('Refresh local tasks and alerts')
+        layout.addWidget(refresh)
+        def update():
+            rt = get_runtime()
+            jobs = [{key: job.get(key) for key in ('id', 'kind', 'name', 'state', 'progress', 'last_event', 'message', 'error', 'result_path')}
+                    for job in rt.records('job').values()]
+            alerts = sorted(rt.records('notification').values(), key=lambda item: item['at'], reverse=True)[:30]
+            display.setPlainText(json.dumps({'jobs': jobs[-50:], 'alerts': alerts}, indent=2, ensure_ascii=False))
+        refresh.clicked.connect(update)
+        update()
+        dialog.exec()
+
+    def _show_calling(self):
+        """Local-only snapshot. Never dial, test credentials or poll on open."""
+        import json
+        from core.calling_manager import snapshot
+        dialog = QDialog(self)
+        dialog.setWindowTitle('JARVIS Calling')
+        dialog.setMinimumSize(620, 480)
+        dialog.setStyleSheet(f'QDialog {{ background: {C.DARK}; }} QLabel {{ color: {C.TEXT}; }}')
+        layout = QVBoxLayout(dialog)
+        message = QLabel('Telephone notifications are opt-in. WhatsApp uses its separate desktop controls. '
+                         'No number is purchased and no call is placed from this panel.')
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        display = QTextEdit()
+        display.setObjectName('calling_status')
+        display.setReadOnly(True)
+        layout.addWidget(display)
+        refresh = QPushButton('Refresh local status (no network)')
+        refresh.setObjectName('calling_refresh')
+        layout.addWidget(refresh)
+        def update():
+            try:
+                display.setPlainText(json.dumps(snapshot(), indent=2, ensure_ascii=False))
+            except Exception as exc:
+                display.setPlainText('Calling configuration could not be read: ' + type(exc).__name__)
+        refresh.clicked.connect(update)
+        update()
+        dialog.exec()
+
+    def _edit_wake_phrase(self):
+        from memory.config_manager import get_wake_config, save_wake_config
+        selected = get_wake_config()
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Local wake phrase')
+        dialog.setMinimumWidth(440)
+        dialog.setStyleSheet(f'QDialog {{ background: {C.DARK}; }} QLabel, QCheckBox {{ color: {C.TEXT}; }}')
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel('Wake phrase (offline English, 2–12 words)'))
+        phrase = QLineEdit(selected['phrase'])
+        phrase.setObjectName('wake_phrase_input')
+        phrase.setMaxLength(120)
+        layout.addWidget(phrase)
+        fallback = QCheckBox('Also accept Hey Jarvis')
+        fallback.setObjectName('wake_fallback_input')
+        fallback.setChecked(selected['fallback_enabled'])
+        layout.addWidget(fallback)
+        message = QLabel('Audio stays local while sleeping. Wake phrases are not speaker authentication.')
+        message.setWordWrap(True)
+        layout.addWidget(message)
+        save = QPushButton('Save wake phrase')
+        save.setObjectName('wake_phrase_save')
+        layout.addWidget(save)
+        def apply():
+            try:
+                callback = self.on_wake_phrase
+                result = callback(phrase.text(), fallback.isChecked()) if callback else save_wake_config(phrase.text(), fallback.isChecked())
+                self._log_sig.emit('SYS: Wake phrase saved: ' + result['phrase'])
+                self._refresh_wake_btns()
+                dialog.accept()
+            except Exception as exc:
+                message.setText('Could not save: ' + str(exc))
+        save.clicked.connect(apply)
+        dialog.exec()
 
     def _toggle_wake_word(self):
         st = self._wake_state()
@@ -7043,6 +7172,14 @@ class JarvisUI:
         self._win.on_wake_manual = cb
 
     @property
+    def on_wake_phrase(self):
+        return self._win.on_wake_phrase
+
+    @on_wake_phrase.setter
+    def on_wake_phrase(self, cb):
+        self._win.on_wake_phrase = cb
+
+    @property
     def wake_get_state(self):
         return self._win.wake_get_state
 
@@ -7100,6 +7237,10 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def desktop_notification(self, title, message):
+        self._win._desktop_notice_sig.emit(str(title), str(message))
+        return 'queued_to_ui; visibility_not_verified'
 
     def wait_for_api_key(self):
         while not self._win._ready:

@@ -7,18 +7,24 @@ from plugins._automation_common import declaration, string, report
 
 PLUGIN = declaration("automation_status",
     "Show JARVIS task context, measured tool latency, available dependencies, or CPU/RAM/process load to investigate slowness.",
-    {"action": string(choices=["status", "context", "performance"])})
+    {"action": string(choices=["status", "context", "performance", "capabilities"])})
 
 
 def run(parameters, player=None, session_memory=None):
     try:
         rt = get_runtime()
         action = parameters.get("action", "status")
+        if action == 'capabilities':
+            catalog = rt.catalog_provider() if callable(getattr(rt, 'catalog_provider', None)) else getattr(rt, 'catalog', [])
+            return report('automation_status', {'enabled_tools': [
+                {'name': tool['name'], 'parameters': tool.get('parameters', {})} for tool in catalog],
+                'note': 'Current enabled registry inventory; provider budgets may expose a subset.'})
         if action == "context":
             return report("automation_status", rt.context())
         if action == "performance":
+            from core.performance_report import performance_report
             return report("automation_status", {"tool_timings": rt.stats(),
-                "note": "Tool execution timings only; speech/model timings remain in the existing provider log"})
+                'phases': performance_report(rt.path)})
         if action != "status":
             raise ValueError("Unknown status action")
         import psutil

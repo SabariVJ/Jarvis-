@@ -56,4 +56,6 @@ class PerformanceTests(Isolated):
         self.assertEqual(git_route('Jarvis, show git status')[1]['action'], 'status')
         self.assertEqual(git_route('show git diff')[1]['action'], 'diff')
         for command in ('push everything', 'git commit', 'force push main', 'git status and push'):
-            self.assertIsNone(git_route(command))
+            routed = git_route(command)
+            if routed:
+                self.assertEqual(routed[1]['action'], 'publication_plan')

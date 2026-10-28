@@ -258,6 +258,12 @@ def unwrap(text: str) -> str:
                              .replace("<<<UNTRUSTED-ESCAPED", "<<<UNTRUSTED")
 
 
+def is_verified(result: str) -> bool:
+    """The done contract is verified, unless explicit facts contradict it."""
+    text = str(result or '')
+    return text.startswith('status=done ') and not re.search(r'\b(?:verified|chat_verified|success)=(?:false|False|0)\b', text)
+
+
 def is_problem(result: str) -> bool:
     """Does this tool result need the user's attention?
 
